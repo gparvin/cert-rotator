@@ -2,6 +2,7 @@ package certcontroller
 
 import (
 	"context"
+	"crypto/x509"
 	"fmt"
 	"testing"
 	"time"
@@ -10,55 +11,27 @@ import (
 	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
-	kubeinformers "k8s.io/client-go/informers"
 	"k8s.io/client-go/kubernetes"
 	fakekube "k8s.io/client-go/kubernetes/fake"
 	"k8s.io/client-go/util/cert"
-
-	fakeoperatorclient "github.com/open-cluster-management/api/client/operator/clientset/versioned/fake"
-	operatorinformers "github.com/open-cluster-management/api/client/operator/informers/externalversions"
-	operatorapiv1 "github.com/open-cluster-management/api/operator/v1"
-	"github.com/open-cluster-management/registration-operator/pkg/certrotation"
-	"github.com/open-cluster-management/registration-operator/pkg/helpers"
-	testinghelper "github.com/open-cluster-management/registration-operator/pkg/helpers/testing"
 )
 
 const testClusterManagerName = "testclustermanager"
+const testNamespace = "default"
 
 var secretNames = []string{"signer-key-pair-secret", "serving-cert-key-pair-secret"}
-
-func newClusterManager() *operatorapiv1.ClusterManager {
-	return &operatorapiv1.ClusterManager{
-		ObjectMeta: metav1.ObjectMeta{
-			Name: testClusterManagerName,
-		},
-		Spec: operatorapiv1.ClusterManagerSpec{
-			RegistrationImagePullSpec: "testregistration",
-		},
-	}
-}
 
 type validateFunc func(t *testing.T, kubeClient kubernetes.Interface, err error)
 
 func TestCertRotation(t *testing.T) {
+
 	cases := []struct {
 		name            string
-		clusterManager  *operatorapiv1.ClusterManager
 		existingObjects []runtime.Object
 		validate        validateFunc
 	}{
 		{
-			name: "no cluster manager",
-			validate: func(t *testing.T, kubeClient kubernetes.Interface, err error) {
-				if err != nil {
-					t.Fatalf("unexpected error: %v", err)
-				}
-				assertNoSecretCreated(t, kubeClient)
-			},
-		},
-		{
-			name:           "no namespace",
-			clusterManager: newClusterManager(),
+			name: "no namespace",
 			validate: func(t *testing.T, kubeClient kubernetes.Interface, err error) {
 				if err == nil {
 					t.Fatalf("expected an error")
@@ -67,12 +40,11 @@ func TestCertRotation(t *testing.T) {
 			},
 		},
 		{
-			name:           "rotate cert",
-			clusterManager: newClusterManager(),
+			name: "rotate cert",
 			existingObjects: []runtime.Object{
 				&corev1.Namespace{
 					ObjectMeta: metav1.ObjectMeta{
-						Name: helpers.ClusterManagerNamespace,
+						Name: testNamespace,
 					},
 				},
 			},
@@ -88,67 +60,54 @@ func TestCertRotation(t *testing.T) {
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
 			kubeClient := fakekube.NewSimpleClientset(c.existingObjects...)
-			kubeInformer := kubeinformers.NewSharedInformerFactory(kubeClient, 5*time.Minute)
-			clusterManagers := []runtime.Object{}
-			if c.clusterManager != nil {
-				clusterManagers = append(clusterManagers, c.clusterManager)
-			}
-			operatorClient := fakeoperatorclient.NewSimpleClientset(clusterManagers...)
-			operatorInformers := operatorinformers.NewSharedInformerFactory(operatorClient, 5*time.Minute)
-			clusterManagerStore := operatorInformers.Operator().V1().ClusterManagers().Informer().GetStore()
-			for _, clusterManager := range clusterManagers {
-				clusterManagerStore.Add(clusterManager)
-			}
 
-			syncContext := testinghelper.NewFakeSyncContext(t, "")
-			recorder := syncContext.Recorder()
-
-			signingRotation := certrotation.SigningRotation{
-				Namespace:        helpers.ClusterManagerNamespace,
+			signingRotation := SigningRotation{
+				Namespace:        testNamespace,
 				Name:             "signer-key-pair-secret",
 				SignerNamePrefix: "test-signer",
 				Validity:         time.Hour * 1,
-				Lister:           kubeInformer.Core().V1().Secrets().Lister(),
-				Client:           kubeClient.CoreV1(),
-				EventRecorder:    recorder,
+				Client:           kubeClient,
 			}
 
-			caBundleRotation := certrotation.CABundleRotation{
-				Namespace:     helpers.ClusterManagerNamespace,
-				Name:          "ca-bundle-configmap",
-				Lister:        kubeInformer.Core().V1().ConfigMaps().Lister(),
-				Client:        kubeClient.CoreV1(),
-				EventRecorder: recorder,
+			caBundleRotation := CABundleRotation{
+				Namespace: testNamespace,
+				Name:      "ca-bundle-configmap",
+				Client:    kubeClient,
 			}
-			targetRotations := []certrotation.TargetRotation{
+			targetRotations := []TargetRotation{
 				{
-					Namespace:     helpers.ClusterManagerNamespace,
-					Name:          "serving-cert-key-pair-secret",
-					Validity:      time.Minute * 30,
-					HostNames:     []string{fmt.Sprintf("service1.%s.svc", helpers.ClusterManagerNamespace)},
-					Lister:        kubeInformer.Core().V1().Secrets().Lister(),
-					Client:        kubeClient.CoreV1(),
-					EventRecorder: recorder,
+					Namespace:  testNamespace,
+					SecretName: "serving-cert-key-pair-secret",
+					Validity:   time.Minute * 30,
+					HostNames:  []string{fmt.Sprintf("service1.%s.svc", testNamespace)},
+					Client:     kubeClient,
 				},
 			}
-
-			controller := &certRotationController{
-				signingRotation:      signingRotation,
-				caBundleRotation:     caBundleRotation,
-				targetRotations:      targetRotations,
-				kubeClient:           kubeClient,
-				clusterManagerLister: operatorInformers.Operator().V1().ClusterManagers().Lister(),
+			options := Options{
+				RestartPods:           true,
+				RestartSelf:           true,
+				Frequency:             300,
+				CASigningCertValidity: 240,
+				TargetCertValidity:    48,
+			}
+			controller := &CertRotationController{
+				SigningRotation:  signingRotation,
+				CABundleRotation: caBundleRotation,
+				TargetRotations:  targetRotations,
+				GeneratedClient:  kubeClient,
+				Options:          options,
 			}
 
-			err := controller.sync(context.TODO(), syncContext)
+			err := syncCerts(context.TODO(), *controller)
 			c.validate(t, kubeClient, err)
+
 		})
 	}
 }
 
 func assertNoSecretCreated(t *testing.T, kubeClient kubernetes.Interface) {
 	for _, name := range secretNames {
-		_, err := kubeClient.CoreV1().Secrets(helpers.ClusterManagerNamespace).Get(context.Background(), name, metav1.GetOptions{})
+		_, err := kubeClient.CoreV1().Secrets(testNamespace).Get(context.Background(), name, metav1.GetOptions{})
 		if err == nil {
 			t.Fatalf("unexpected secret %q", name)
 		}
@@ -158,37 +117,42 @@ func assertNoSecretCreated(t *testing.T, kubeClient kubernetes.Interface) {
 	}
 }
 
+func assertSecretExistsAndValid(t *testing.T, kubeClient kubernetes.Interface, name string, namespace string) (*x509.Certificate, error) {
+	secret, err := kubeClient.CoreV1().Secrets(namespace).Get(context.Background(), name, metav1.GetOptions{})
+	if errors.IsNotFound(err) {
+		t.Fatalf("secret not found: %v", name)
+	}
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	certificates, err := cert.ParseCertsPEM(secret.Data["tls.crt"])
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(certificates) == 0 {
+		t.Fatalf("no certificate found")
+	}
+
+	now := time.Now()
+	certificate := certificates[0]
+	if now.After(certificate.NotAfter) {
+		t.Fatalf("invalid NotAfter: %s", name)
+	}
+	if now.Before(certificate.NotBefore) {
+		t.Fatalf("invalid NotBefore: %s", name)
+	}
+	return certificate, nil
+}
+
 func assertSecretsExistAndValid(t *testing.T, kubeClient kubernetes.Interface) {
-	configmap, err := kubeClient.CoreV1().ConfigMaps(helpers.ClusterManagerNamespace).Get(context.Background(), "ca-bundle-configmap", metav1.GetOptions{})
+	configmap, err := kubeClient.CoreV1().ConfigMaps(testNamespace).Get(context.Background(), "ca-bundle-configmap", metav1.GetOptions{})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 
 	for _, name := range secretNames {
-		secret, err := kubeClient.CoreV1().Secrets(helpers.ClusterManagerNamespace).Get(context.Background(), name, metav1.GetOptions{})
-		if errors.IsNotFound(err) {
-			t.Fatalf("secret not found: %v", name)
-		}
-		if err != nil {
-			t.Fatalf("unexpected error: %v", err)
-		}
-
-		certificates, err := cert.ParseCertsPEM(secret.Data["tls.crt"])
-		if err != nil {
-			t.Fatalf("unexpected error: %v", err)
-		}
-		if len(certificates) == 0 {
-			t.Fatalf("no certificate found")
-		}
-
-		now := time.Now()
-		certificate := certificates[0]
-		if now.After(certificate.NotAfter) {
-			t.Fatalf("invalid NotAfter: %s", name)
-		}
-		if now.Before(certificate.NotBefore) {
-			t.Fatalf("invalid NotBefore: %s", name)
-		}
+		certificate, _ := assertSecretExistsAndValid(t, kubeClient, name, testNamespace)
 
 		if name == "signer-key-pair-secret" {
 			continue
@@ -201,6 +165,7 @@ func assertSecretsExistAndValid(t *testing.T, kubeClient kubernetes.Interface) {
 		}
 
 		found := false
+		now := time.Now()
 		for _, caCert := range caCerts {
 			if certificate.Issuer.CommonName != caCert.Subject.CommonName {
 				continue
@@ -217,5 +182,79 @@ func assertSecretsExistAndValid(t *testing.T, kubeClient kubernetes.Interface) {
 		if !found {
 			t.Fatalf("no issuer found: %s", name)
 		}
+	}
+}
+
+func TestTargetUpdates(t *testing.T) {
+	existingObjects := []runtime.Object{
+		&corev1.Namespace{
+			ObjectMeta: metav1.ObjectMeta{
+				Name: testNamespace,
+			},
+		},
+	}
+
+	kubeClient := fakekube.NewSimpleClientset(existingObjects...)
+
+	signingRotation := SigningRotation{
+		Namespace:        testNamespace,
+		Name:             "signer-key-pair-secret",
+		SignerNamePrefix: "test-signer",
+		Validity:         time.Hour * 1,
+		Client:           kubeClient,
+	}
+
+	caBundleRotation := CABundleRotation{
+		Namespace: testNamespace,
+		Name:      "ca-bundle-configmap",
+		Client:    kubeClient,
+	}
+	targetRotations := []TargetRotation{
+		{
+			Namespace:  testNamespace,
+			SecretName: "serving-cert-key-pair-secret",
+			Validity:   time.Minute * 30,
+			HostNames:  []string{fmt.Sprintf("service1.%s.svc", testNamespace)},
+			Client:     kubeClient,
+		},
+	}
+	options := Options{
+		RestartPods:           true,
+		RestartSelf:           true,
+		Frequency:             300,
+		CASigningCertValidity: 240,
+		TargetCertValidity:    48,
+	}
+	controller := CertRotationController{
+		SigningRotation:  signingRotation,
+		CABundleRotation: caBundleRotation,
+		TargetRotations:  targetRotations,
+		GeneratedClient:  kubeClient,
+		Options:          options,
+	}
+	target := TargetRotation{
+		Namespace:  testNamespace,
+		SecretName: "added-secret",
+		Validity:   time.Minute * 30,
+		HostNames:  []string{fmt.Sprintf("added1.%s.svc", testNamespace)},
+		Client:     kubeClient,
+	}
+
+	err := syncCerts(context.TODO(), controller)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	assertSecretsExistAndValid(t, kubeClient)
+
+	err = AddTarget(context.TODO(), controller, target)
+	assertSecretExistsAndValid(t, kubeClient, target.SecretName, testNamespace)
+
+	err = RemoveTarget(context.TODO(), controller, target.Namespace, target.SecretName)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	secret, err := kubeClient.CoreV1().Secrets(testNamespace).Get(context.Background(), target.SecretName, metav1.GetOptions{})
+	if secret != nil || err == nil {
+		t.Fatalf("secret was found: %v", target.SecretName)
 	}
 }

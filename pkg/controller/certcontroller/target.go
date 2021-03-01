@@ -3,46 +3,54 @@ package certcontroller
 import (
 	"context"
 	"crypto/x509"
+	"crypto/x509/pkix"
 	"fmt"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/sets"
-	"sigs.k8s.io/controller-runtime/pkg/client"
+	appsv1 "k8s.io/client-go/kubernetes/typed/apps/v1"
+	"k8s.io/klog"
 
 	"github.com/openshift/library-go/pkg/certs"
 	"github.com/openshift/library-go/pkg/crypto"
+	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/util/cert"
+)
+
+const (
+	restartLabel        = "security.open-cluster-management.io/time-restarted"
+	noRestartAnnotation = "security.open-cluster-management.io/disable-auto-restart"
 )
 
 // TargetRotation rotates a key and cert signed by a CA. It creates a new one when 80%
 // of the lifetime of the old cert has passed, or the CA used to signed the old cert is
 // gone from the CA bundle.
 type TargetRotation struct {
-	Namespace string
-	Name      string
-	Validity  time.Duration
-	HostNames []string
-	Client    client.Client
+	Namespace  string
+	SecretName string
+	Validity   time.Duration
+	HostNames  []string
+	Name       pkix.Name
+	Client     kubernetes.Interface
 }
 
 // EnsureTargetCertKeyPair makes sure the certificate is updated in the secret
-func (c TargetRotation) EnsureTargetCertKeyPair(signingCertKeyPair *crypto.CA, caBundleCerts []*x509.Certificate) error {
-	originalTargetCertKeyPairSecret := &corev1.Secret{}
-	err := c.Client.Get(context.Background(),
-		types.NamespacedName{Namespace: c.Namespace, Name: c.Name}, originalTargetCertKeyPairSecret)
+func (c TargetRotation) EnsureTargetCertKeyPair(signingCertKeyPair *crypto.CA, caBundleCerts []*x509.Certificate, client kubernetes.Interface, restartPods bool) error {
+	originalTargetCertKeyPairSecret, err := c.Client.CoreV1().Secrets(c.Namespace).Get(context.Background(), c.SecretName, metav1.GetOptions{})
 	if err != nil && !apierrors.IsNotFound(err) {
 		return err
 	}
 	createSecret := false
-	targetCertKeyPairSecret := originalTargetCertKeyPairSecret.DeepCopy()
+	var targetCertKeyPairSecret *corev1.Secret
 	if apierrors.IsNotFound(err) {
 		// create an empty one
-		targetCertKeyPairSecret = &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Namespace: c.Namespace, Name: c.Name}}
+		targetCertKeyPairSecret = &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Namespace: c.Namespace, Name: c.SecretName}}
 		createSecret = true
+	} else {
+		targetCertKeyPairSecret = originalTargetCertKeyPairSecret.DeepCopy()
 	}
 	targetCertKeyPairSecret.Type = corev1.SecretTypeTLS
 
@@ -56,13 +64,20 @@ func (c TargetRotation) EnsureTargetCertKeyPair(signingCertKeyPair *crypto.CA, c
 	}
 
 	if createSecret {
-		if err = c.Client.Create(context.Background(), targetCertKeyPairSecret); err != nil {
+		if _, err = c.Client.CoreV1().Secrets(c.Namespace).Create(context.Background(), targetCertKeyPairSecret, metav1.CreateOptions{}); err != nil {
 			return err
 		}
 	} else {
-		if err = c.Client.Update(context.Background(), targetCertKeyPairSecret); err != nil {
+		if _, err = c.Client.CoreV1().Secrets(c.Namespace).Update(context.Background(), targetCertKeyPairSecret, metav1.UpdateOptions{}); err != nil {
 			return err
 		}
+	}
+
+	if restartPods {
+		deploymentsInterface := client.AppsV1().Deployments(c.Namespace)
+		statefulsetsInterface := client.AppsV1().StatefulSets(c.Namespace)
+		daemonsetsInterface := client.AppsV1().DaemonSets(c.Namespace)
+		restart(deploymentsInterface, statefulsetsInterface, daemonsetsInterface, c.SecretName, client)
 	}
 	return nil
 }
@@ -139,10 +154,76 @@ func (c TargetRotation) setTargetCertKeyPairSecret(targetCertKeyPairSecret *core
 	return nil
 }
 
+func (c TargetRotation) customizeCertificate(certificate *x509.Certificate) error {
+	certificate.Subject = c.Name
+	return nil
+}
+
 // NewCertificate creates a new certificate
 func (c TargetRotation) NewCertificate(signer *crypto.CA, validity time.Duration) (*crypto.TLSCertificateConfig, error) {
 	if len(c.HostNames) == 0 {
 		return nil, fmt.Errorf("no hostnames set")
 	}
-	return signer.MakeServerCertForDuration(sets.NewString(c.HostNames...), validity)
+	return signer.MakeServerCertForDuration(sets.NewString(c.HostNames...), validity, c.customizeCertificate)
+}
+
+// restart will run every time a secret is updated for a certificate and when
+// pod refresh is enabled. It will edit the deployments, statefulsets, and daemonsets
+// that use the secret being updated, which will trigger the pod to be restarted.
+func restart(deploymentsInterface appsv1.DeploymentInterface, statefulsetsInterface appsv1.StatefulSetInterface, daemonsetsInterface appsv1.DaemonSetInterface, secret string, client kubernetes.Interface) {
+	listOptions := metav1.ListOptions{}
+	deployments, _ := deploymentsInterface.List(context.TODO(), listOptions)
+	statefulsets, _ := statefulsetsInterface.List(context.TODO(), listOptions)
+	daemonsets, _ := daemonsetsInterface.List(context.TODO(), listOptions)
+
+	update := time.Now().Format("2006-1-2.1504")
+	updateOptions := metav1.UpdateOptions{}
+NEXT_DEPLOYMENT:
+	for _, adeployment := range deployments.Items {
+		deployment := adeployment
+		for _, volume := range deployment.Spec.Template.Spec.Volumes {
+			if volume.Secret != nil && volume.Secret.SecretName != "" && volume.Secret.SecretName == secret && deployment.ObjectMeta.Annotations[noRestartAnnotation] != "true" {
+				deployment.ObjectMeta.Labels[restartLabel] = update
+				deployment.Spec.Template.ObjectMeta.Labels[restartLabel] = update
+				_, err := deploymentsInterface.Update(context.TODO(), &deployment, updateOptions)
+				if err != nil {
+					klog.Errorf("Error updating deployment: %v", err)
+				}
+				klog.Infof("%s Cert-Rotator Restarting Resource: Secret=%s, Deployment=%s", update, secret, deployment.ObjectMeta.Name)
+				continue NEXT_DEPLOYMENT
+			}
+		}
+	}
+NEXT_STATEFULSET:
+	for _, astatefulset := range statefulsets.Items {
+		statefulset := astatefulset
+		for _, volume := range statefulset.Spec.Template.Spec.Volumes {
+			if volume.Secret != nil && volume.Secret.SecretName != "" && volume.Secret.SecretName == secret && statefulset.ObjectMeta.Annotations[noRestartAnnotation] != "true" {
+				statefulset.ObjectMeta.Labels[restartLabel] = update
+				statefulset.Spec.Template.ObjectMeta.Labels[restartLabel] = update
+				_, err := statefulsetsInterface.Update(context.TODO(), &statefulset, updateOptions)
+				if err != nil {
+					klog.Errorf("Error updating statefulset: %v", err)
+				}
+				klog.Infof("%s Cert-Rotator Restarting Resource: Secret=%s, StatefulSet=%s", update, secret, statefulset.ObjectMeta.Name)
+				continue NEXT_STATEFULSET
+			}
+		}
+	}
+NEXT_DAEMONSET:
+	for _, adaemonset := range daemonsets.Items {
+		daemonset := adaemonset
+		for _, volume := range daemonset.Spec.Template.Spec.Volumes {
+			if volume.Secret != nil && volume.Secret.SecretName != "" && volume.Secret.SecretName == secret && daemonset.ObjectMeta.Annotations[noRestartAnnotation] != "true" {
+				daemonset.ObjectMeta.Labels[restartLabel] = update
+				daemonset.Spec.Template.ObjectMeta.Labels[restartLabel] = update
+				_, err := daemonsetsInterface.Update(context.TODO(), &daemonset, updateOptions)
+				if err != nil {
+					klog.Errorf("Error updating daemonset: %v", err)
+				}
+				klog.Infof("%s Cert-Rotator Restarting Resource: Secret=%s, DaemonSet=%s", update, secret, daemonset.ObjectMeta.Name)
+				continue NEXT_DAEMONSET
+			}
+		}
+	}
 }

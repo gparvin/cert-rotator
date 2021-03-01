@@ -17,8 +17,9 @@ limitations under the License.
 package main
 
 import (
+	"context"
+	"crypto/x509/pkix"
 	"flag"
-	"fmt"
 	"os"
 	"time"
 
@@ -56,11 +57,15 @@ func main() {
 	var metricsAddr string
 	var enableLeaderElection bool
 	var probeAddr string
+	var restartPods bool
 	flag.StringVar(&metricsAddr, "metrics-bind-address", ":8080", "The address the metric endpoint binds to.")
 	flag.StringVar(&probeAddr, "health-probe-bind-address", ":8081", "The address the probe endpoint binds to.")
 	flag.BoolVar(&enableLeaderElection, "leader-elect", false,
 		"Enable leader election for controller manager. "+
 			"Enabling this will ensure there is only one active controller manager.")
+	flag.BoolVar(&restartPods, "restart-pods", false,
+		"Enable restarting pods when the certificate changes. "+
+			"Enabling this will ensure pods get restarted when the certificate rotates.")
 	opts := zap.Options{
 		Development: true,
 	}
@@ -105,44 +110,62 @@ func main() {
 
 	var SigningCertValidity = time.Hour * 24 * 10
 	var TargetCertValidity = time.Hour * 24 * 2
+	var pkiname pkix.Name
+	pkiname.OrganizationalUnit = []string{"hello-org-unit"}
 
 	signingRotation := certrotationcontroller.SigningRotation{
 		Namespace:        "open-cluster-management",
 		Name:             signerSecret,
 		SignerNamePrefix: signerNamePrefix,
 		Validity:         SigningCertValidity,
-		Client:           mgr.GetClient(),
+		Client:           generatedClient,
 	}
 	caBundleRotation := certrotationcontroller.CABundleRotation{
 		Namespace: "open-cluster-management",
 		Name:      caBundleConfigmap,
-		Client:    mgr.GetClient(),
+		Client:    generatedClient,
 	}
 	targetRotations := []certrotationcontroller.TargetRotation{
 		{
-			Namespace: "open-cluster-management",
-			Name:      "test1",
-			Validity:  TargetCertValidity,
-			HostNames: []string{fmt.Sprintf("%s.%s.svc", "test1", "open-cluster-management")},
-			Client:    mgr.GetClient(),
+			Namespace:  "open-cluster-management",
+			SecretName: "management-ingress-1dfac-tls-secret",
+			Validity:   TargetCertValidity,
+			HostNames:  []string{"multicloud-console.apps.gparvin.dev08.red-chesterfield.com", "management-ingress", "127.0.0.1", "localhost"},
+			Client:     generatedClient,
 		},
 		{
-			Namespace: "open-cluster-management",
-			Name:      "test2",
-			Validity:  TargetCertValidity,
-			HostNames: []string{fmt.Sprintf("%s.%s.svc", "test2", "open-cluster-management")},
-			Client:    mgr.GetClient(),
+			Namespace:  "open-cluster-management",
+			SecretName: "oauth-proxy-tls-secret",
+			Validity:   TargetCertValidity,
+			HostNames:  []string{"multicloud-console.apps.gparvin.dev08.red-chesterfield.com"},
+			Name:       pkiname,
+			Client:     generatedClient,
 		},
 	}
+	options := certrotationcontroller.Options{}
+	options.RestartPods = true
+	options.RestartSelf = false
 	c := certrotationcontroller.CertRotationController{
 		SigningRotation:  signingRotation,
 		CABundleRotation: caBundleRotation,
 		TargetRotations:  targetRotations,
+		GeneratedClient:  generatedClient,
+		Options:          options,
 	}
-	go certctrl.StartCertManagement(mgr, c, generatedClient, true)
+	go certctrl.StartCertManagement(mgr, c, true)
+
+	target := certrotationcontroller.TargetRotation{
+		Namespace:  "default",
+		SecretName: "added-secret",
+		Validity:   time.Minute * 30,
+		HostNames:  []string{"added-secret.default.svc"},
+		Client:     generatedClient,
+	}
+	certctrl.AddTarget(context.TODO(), c, target)
 
 	if err := mgr.Start(ctrl.SetupSignalHandler()); err != nil {
 		setupLog.Error(err, "problem running manager")
 		os.Exit(1)
 	}
+
 }

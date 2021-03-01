@@ -10,9 +10,8 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/util/cert"
-	"sigs.k8s.io/controller-runtime/pkg/client"
 )
 
 // SigningRotation rotates a self-signed signing CA stored in a secret. It creates a new one when 80%
@@ -22,21 +21,23 @@ type SigningRotation struct {
 	Name             string
 	SignerNamePrefix string
 	Validity         time.Duration
-	Client           client.Client
+	Client           kubernetes.Interface
 }
 
 // EnsureSigningCertKeyPair makes sure the certificate is signed
 func (c SigningRotation) EnsureSigningCertKeyPair() (*crypto.CA, error) {
-	originalSigningCertKeyPairSecret := &corev1.Secret{}
-	err := c.Client.Get(context.Background(),
-		types.NamespacedName{Namespace: c.Namespace, Name: c.Name}, originalSigningCertKeyPairSecret)
+	originalSigningCertKeyPairSecret, err := c.Client.CoreV1().Secrets(c.Namespace).Get(context.TODO(), c.Name, metav1.GetOptions{})
 	if err != nil && !apierrors.IsNotFound(err) {
 		return nil, err
 	}
-	signingCertKeyPairSecret := originalSigningCertKeyPairSecret.DeepCopy()
+	createSecret := false
+	var signingCertKeyPairSecret *corev1.Secret
 	if apierrors.IsNotFound(err) {
 		// create an empty one
 		signingCertKeyPairSecret = &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Namespace: c.Namespace, Name: c.Name}}
+		createSecret = true
+	} else {
+		signingCertKeyPairSecret = originalSigningCertKeyPairSecret.DeepCopy()
 	}
 	signingCertKeyPairSecret.Type = corev1.SecretTypeTLS
 
@@ -45,7 +46,11 @@ func (c SigningRotation) EnsureSigningCertKeyPair() (*crypto.CA, error) {
 			return nil, err
 		}
 
-		err = c.Client.Update(context.Background(), signingCertKeyPairSecret)
+		if createSecret {
+			_, err = c.Client.CoreV1().Secrets(c.Namespace).Create(context.Background(), signingCertKeyPairSecret, metav1.CreateOptions{})
+		} else {
+			_, err = c.Client.CoreV1().Secrets(c.Namespace).Update(context.Background(), signingCertKeyPairSecret, metav1.UpdateOptions{})
+		}
 		if err != nil {
 			return nil, err
 		}

@@ -10,9 +10,8 @@ import (
 	"k8s.io/apimachinery/pkg/api/equality"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/util/cert"
-	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	"github.com/openshift/library-go/pkg/crypto"
 )
@@ -21,29 +20,35 @@ import (
 type CABundleRotation struct {
 	Namespace string
 	Name      string
-	Client    client.Client
+	Client    kubernetes.Interface
 }
 
 // EnsureConfigMapCABundle validates the CA bundle is updated
 func (c CABundleRotation) EnsureConfigMapCABundle(signingCertKeyPair *crypto.CA) ([]*x509.Certificate, error) {
 	// by this point we have current signing cert/key pair.  We now need to make sure that the ca-bundle configmap has this cert and
 	// doesn't have any expired certs
-	originalCABundleConfigMap := &corev1.ConfigMap{}
-	err := c.Client.Get(context.Background(),
-		types.NamespacedName{Namespace: c.Namespace, Name: c.Name}, originalCABundleConfigMap)
+	originalCABundleConfigMap, err := c.Client.CoreV1().ConfigMaps(c.Namespace).Get(context.Background(), c.Name, metav1.GetOptions{})
 	if err != nil && !apierrors.IsNotFound(err) {
 		return nil, err
 	}
-	caBundleConfigMap := originalCABundleConfigMap.DeepCopy()
+	var caBundleConfigMap *corev1.ConfigMap
+	createConfig := false
 	if apierrors.IsNotFound(err) {
 		// create an empty one
 		caBundleConfigMap = &corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Namespace: c.Namespace, Name: c.Name}}
+		createConfig = true
+	} else {
+		caBundleConfigMap = originalCABundleConfigMap.DeepCopy()
 	}
 	if _, err = manageCABundleConfigMap(caBundleConfigMap, signingCertKeyPair.Config.Certs[0]); err != nil {
 		return nil, err
 	}
 	if originalCABundleConfigMap == nil || originalCABundleConfigMap.Data == nil || !equality.Semantic.DeepEqual(originalCABundleConfigMap.Data, caBundleConfigMap.Data) {
-		err = c.Client.Update(context.Background(), caBundleConfigMap)
+		if createConfig {
+			_, err = c.Client.CoreV1().ConfigMaps(c.Namespace).Create(context.Background(), caBundleConfigMap, metav1.CreateOptions{})
+		} else {
+			_, err = c.Client.CoreV1().ConfigMaps(c.Namespace).Update(context.Background(), caBundleConfigMap, metav1.UpdateOptions{})
+		}
 		if err != nil {
 			return nil, err
 		}

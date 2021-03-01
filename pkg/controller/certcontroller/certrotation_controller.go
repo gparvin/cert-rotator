@@ -3,6 +3,7 @@ package certcontroller
 import (
 	"context"
 	"fmt"
+	"sync"
 	"time"
 
 	errorhelpers "github.com/openshift/library-go/pkg/operator/v1helpers"
@@ -11,8 +12,6 @@ import (
 	"k8s.io/client-go/kubernetes"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/manager"
-
-	"github.com/open-cluster-management/registration-operator/pkg/helpers"
 )
 
 var setupLog = ctrl.Log.WithName("certcontroller")
@@ -21,12 +20,16 @@ var setupLog = ctrl.Log.WithName("certcontroller")
 //
 // 1) SigningCertValidity * 1/5 * 1/5 > ResyncInterval * 2
 // 2) TargetCertValidity * 1/5 > ResyncInterval * 2
-var DefaultCASigningCertValidity = time.Hour * 24 * 10
-var DefaultTargetCertValidity = time.Hour * 24 * 2
-var DefaultResyncInterval = time.Minute * 5
-var ResyncInterval = time.Minute * 5
 
-// certRotationController does:
+// DefaultCASigningCertValidity is the default CA certificate lifetime in hours
+var DefaultCASigningCertValidity uint = 24 * 365
+
+// DefaultTargetCertValidity is th default signed certificate lifetime in hours
+var DefaultTargetCertValidity uint = 24 * 90
+
+var mutex sync.Mutex
+
+// CertRotationController does:
 //
 // 1) continuously create a self-signed signing CA (via SigningRotation).
 //    It creates the next one when a given percentage of the validity of the old CA has passed.
@@ -38,17 +41,43 @@ type CertRotationController struct {
 	SigningRotation  SigningRotation
 	CABundleRotation CABundleRotation
 	TargetRotations  []TargetRotation
+	GeneratedClient  kubernetes.Interface
+	Options          Options
+}
+
+// Options provides some configuration settings for the controller
+type Options struct {
+	// RestartPods restarts any pods with the secret mounted when the certificate is refreshed
+	RestartPods bool
+	// RestartSelf restarts the current process if any certificates are refreshed
+	RestartSelf bool
+	// Frequency is how often to resync the certificates; specified in seconds
+	Frequency uint
+	// CASigningCertValidity is the default time in hours that the CA certificate is valid
+	CASigningCertValidity uint
+	// TargetCertValidity is the default time in hours that a signed certificate is valid
+	TargetCertValidity uint
 }
 
 // StartCertManagement manages a certificate using a controller to monitor changes to the secret
-func StartCertManagement(mgr manager.Manager, certinfo CertRotationController, client kubernetes.Interface, loopflag bool) {
+func StartCertManagement(mgr manager.Manager, certinfo CertRotationController, loopflag bool) {
 
-	var freq uint = 300
+	if certinfo.Options.Frequency == 0 {
+		certinfo.Options.Frequency = 300
+	}
+	if certinfo.Options.CASigningCertValidity == 0 {
+		certinfo.Options.CASigningCertValidity = DefaultCASigningCertValidity
+	}
+	if certinfo.Options.TargetCertValidity == 0 {
+		certinfo.Options.TargetCertValidity = DefaultTargetCertValidity
+	}
 	setupLog.Info("Initializing controller")
 	for {
 		start := time.Now()
 
-		err := sync(context.TODO(), certinfo, client)
+		mutex.Lock()
+		err := syncCerts(context.TODO(), certinfo)
+		mutex.Unlock()
 		if err != nil {
 			setupLog.Error(err, "Sync error")
 		}
@@ -59,8 +88,8 @@ func StartCertManagement(mgr manager.Manager, certinfo CertRotationController, c
 			//making sure that if processing is > freq we don't sleep
 			//if freq > processing we sleep for the remaining duration
 			elapsed = time.Since(start) / 1000000000 // convert to seconds
-			if float64(freq) > float64(elapsed) {
-				remainingSleep := float64(freq) - float64(elapsed)
+			if float64(certinfo.Options.Frequency) > float64(elapsed) {
+				remainingSleep := float64(certinfo.Options.Frequency) - float64(elapsed)
 				time.Sleep(time.Duration(remainingSleep) * time.Second)
 			}
 		} else {
@@ -69,14 +98,58 @@ func StartCertManagement(mgr manager.Manager, certinfo CertRotationController, c
 	}
 }
 
-func sync(ctx context.Context, c CertRotationController, client kubernetes.Interface) error {
+// AddTarget appends a new target certificate to the list that are being managed by the controller
+func AddTarget(ctx context.Context, c CertRotationController, addTarget TargetRotation) error {
+	setupLog.Info("Running AddTarget")
+	mutex.Lock()
+	c.TargetRotations = append(c.TargetRotations, addTarget)
+	err := syncCerts(context.TODO(), c)
+	mutex.Unlock()
+	if err != nil {
+		setupLog.Error(err, "Add target certificate sync error")
+	}
+	return err
+}
+
+// RemoveTarget removes an existing target certificate from the list being managed by the controller
+func RemoveTarget(ctx context.Context, c CertRotationController, namespace string, secretName string) error {
+	setupLog.Info("Running RemoveTarget")
+	mutex.Lock()
+	found := false
+	var index int
+	for x, target := range c.TargetRotations {
+		if target.Namespace == namespace && target.SecretName == secretName {
+			found = true
+			index = x
+			break
+		}
+	}
+	var err error
+	if found {
+		err = c.GeneratedClient.CoreV1().Secrets(namespace).Delete(context.TODO(), secretName, metav1.DeleteOptions{})
+		if err != nil {
+			setupLog.Error(err, "Target certificate secret error")
+		}
+		c.TargetRotations = append(c.TargetRotations[:index], c.TargetRotations[index+1:]...)
+		err = syncCerts(context.TODO(), c)
+		if err != nil {
+			setupLog.Error(err, "Remove target certificate sync error")
+		}
+	} else {
+		err = fmt.Errorf("Target secret to remove was not found: %s/%s", namespace, secretName)
+	}
+	mutex.Unlock()
+	return err
+}
+
+func syncCerts(ctx context.Context, c CertRotationController) error {
 
 	setupLog.Info("Running Sync")
 
 	// check if namespace exists or not
-	_, err := client.CoreV1().Namespaces().Get(ctx, helpers.ClusterManagerNamespace, metav1.GetOptions{})
+	_, err := c.GeneratedClient.CoreV1().Namespaces().Get(ctx, c.SigningRotation.Namespace, metav1.GetOptions{})
 	if errors.IsNotFound(err) {
-		return fmt.Errorf("namespace %q does not exist yet", helpers.ClusterManagerNamespace)
+		return fmt.Errorf("namespace %q does not exist yet", c.SigningRotation.Namespace)
 	}
 	if err != nil {
 		return err
@@ -97,7 +170,7 @@ func sync(ctx context.Context, c CertRotationController, client kubernetes.Inter
 	// reconcile target cert/key pairs
 	errs := []error{}
 	for _, targetRotation := range c.TargetRotations {
-		if err := targetRotation.EnsureTargetCertKeyPair(signingCertKeyPair, cabundleCerts); err != nil {
+		if err := targetRotation.EnsureTargetCertKeyPair(signingCertKeyPair, cabundleCerts, c.GeneratedClient, c.Options.RestartPods); err != nil {
 			errs = append(errs, err)
 		}
 	}
