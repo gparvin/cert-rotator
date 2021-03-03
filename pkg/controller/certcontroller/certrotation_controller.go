@@ -27,6 +27,12 @@ var DefaultCASigningCertValidity uint = 24 * 365
 // DefaultTargetCertValidity is th default signed certificate lifetime in hours
 var DefaultTargetCertValidity uint = 24 * 90
 
+// CertManagement is the CertRotationController details managed by this controller
+var CertManagement CertRotationController
+
+// firstSync is true only for the first sync call
+var firstSync bool = true
+
 var mutex sync.Mutex
 
 // CertRotationController does:
@@ -62,21 +68,22 @@ type Options struct {
 // StartCertManagement manages a certificate using a controller to monitor changes to the secret
 func StartCertManagement(mgr manager.Manager, certinfo CertRotationController, loopflag bool) {
 
-	if certinfo.Options.Frequency == 0 {
-		certinfo.Options.Frequency = 300
+	CertManagement = certinfo
+	if CertManagement.Options.Frequency == 0 {
+		CertManagement.Options.Frequency = 300
 	}
-	if certinfo.Options.CASigningCertValidity == 0 {
-		certinfo.Options.CASigningCertValidity = DefaultCASigningCertValidity
+	if CertManagement.Options.CASigningCertValidity == 0 {
+		CertManagement.Options.CASigningCertValidity = DefaultCASigningCertValidity
 	}
-	if certinfo.Options.TargetCertValidity == 0 {
-		certinfo.Options.TargetCertValidity = DefaultTargetCertValidity
+	if CertManagement.Options.TargetCertValidity == 0 {
+		CertManagement.Options.TargetCertValidity = DefaultTargetCertValidity
 	}
 	setupLog.Info("Initializing controller")
 	for {
 		start := time.Now()
 
 		mutex.Lock()
-		err := syncCerts(context.TODO(), certinfo)
+		err := syncCerts(context.TODO())
 		mutex.Unlock()
 		if err != nil {
 			setupLog.Error(err, "Sync error")
@@ -88,8 +95,8 @@ func StartCertManagement(mgr manager.Manager, certinfo CertRotationController, l
 			//making sure that if processing is > freq we don't sleep
 			//if freq > processing we sleep for the remaining duration
 			elapsed = time.Since(start) / 1000000000 // convert to seconds
-			if float64(certinfo.Options.Frequency) > float64(elapsed) {
-				remainingSleep := float64(certinfo.Options.Frequency) - float64(elapsed)
+			if float64(CertManagement.Options.Frequency) > float64(elapsed) {
+				remainingSleep := float64(CertManagement.Options.Frequency) - float64(elapsed)
 				time.Sleep(time.Duration(remainingSleep) * time.Second)
 			}
 		} else {
@@ -99,12 +106,12 @@ func StartCertManagement(mgr manager.Manager, certinfo CertRotationController, l
 }
 
 // AddTarget appends a new target certificate to the list that are being managed by the controller
-func AddTarget(ctx context.Context, c CertRotationController, addTarget TargetRotation) error {
+func AddTarget(ctx context.Context, addTarget TargetRotation) error {
 	setupLog.Info("Running AddTarget")
 	mutex.Lock()
-	c.TargetRotations = append(c.TargetRotations, addTarget)
-	err := syncCerts(context.TODO(), c)
-	mutex.Unlock()
+	defer mutex.Unlock()
+	CertManagement.TargetRotations = append(CertManagement.TargetRotations, addTarget)
+	err := syncCerts(context.TODO())
 	if err != nil {
 		setupLog.Error(err, "Add target certificate sync error")
 	}
@@ -112,12 +119,13 @@ func AddTarget(ctx context.Context, c CertRotationController, addTarget TargetRo
 }
 
 // RemoveTarget removes an existing target certificate from the list being managed by the controller
-func RemoveTarget(ctx context.Context, c CertRotationController, namespace string, secretName string) error {
+func RemoveTarget(ctx context.Context, namespace string, secretName string) error {
 	setupLog.Info("Running RemoveTarget")
 	mutex.Lock()
+	defer mutex.Unlock()
 	found := false
 	var index int
-	for x, target := range c.TargetRotations {
+	for x, target := range CertManagement.TargetRotations {
 		if target.Namespace == namespace && target.SecretName == secretName {
 			found = true
 			index = x
@@ -126,53 +134,53 @@ func RemoveTarget(ctx context.Context, c CertRotationController, namespace strin
 	}
 	var err error
 	if found {
-		err = c.GeneratedClient.CoreV1().Secrets(namespace).Delete(context.TODO(), secretName, metav1.DeleteOptions{})
+		err = CertManagement.GeneratedClient.CoreV1().Secrets(namespace).Delete(context.TODO(), secretName, metav1.DeleteOptions{})
 		if err != nil {
 			setupLog.Error(err, "Target certificate secret error")
 		}
-		c.TargetRotations = append(c.TargetRotations[:index], c.TargetRotations[index+1:]...)
-		err = syncCerts(context.TODO(), c)
+		CertManagement.TargetRotations = append(CertManagement.TargetRotations[:index], CertManagement.TargetRotations[index+1:]...)
+		err = syncCerts(context.TODO())
 		if err != nil {
 			setupLog.Error(err, "Remove target certificate sync error")
 		}
 	} else {
 		err = fmt.Errorf("Target secret to remove was not found: %s/%s", namespace, secretName)
 	}
-	mutex.Unlock()
 	return err
 }
 
-func syncCerts(ctx context.Context, c CertRotationController) error {
+func syncCerts(ctx context.Context) error {
 
 	setupLog.Info("Running Sync")
 
 	// check if namespace exists or not
-	_, err := c.GeneratedClient.CoreV1().Namespaces().Get(ctx, c.SigningRotation.Namespace, metav1.GetOptions{})
+	_, err := CertManagement.GeneratedClient.CoreV1().Namespaces().Get(ctx, CertManagement.SigningRotation.Namespace, metav1.GetOptions{})
 	if errors.IsNotFound(err) {
-		return fmt.Errorf("namespace %q does not exist yet", c.SigningRotation.Namespace)
+		return fmt.Errorf("namespace %q does not exist yet", CertManagement.SigningRotation.Namespace)
 	}
 	if err != nil {
 		return err
 	}
 
 	// reconcile cert/key pair for signer
-	signingCertKeyPair, err := c.SigningRotation.EnsureSigningCertKeyPair()
+	signingCertKeyPair, err := CertManagement.SigningRotation.EnsureSigningCertKeyPair()
 	if err != nil {
 		return err
 	}
 
 	// reconcile ca bundle
-	cabundleCerts, err := c.CABundleRotation.EnsureConfigMapCABundle(signingCertKeyPair)
+	cabundleCerts, err := CertManagement.CABundleRotation.EnsureConfigMapCABundle(signingCertKeyPair)
 	if err != nil {
 		return err
 	}
 
 	// reconcile target cert/key pairs
 	errs := []error{}
-	for _, targetRotation := range c.TargetRotations {
-		if err := targetRotation.EnsureTargetCertKeyPair(signingCertKeyPair, cabundleCerts, c.GeneratedClient, c.Options.RestartPods); err != nil {
+	for _, targetRotation := range CertManagement.TargetRotations {
+		if err := targetRotation.EnsureTargetCertKeyPair(signingCertKeyPair, cabundleCerts, CertManagement.GeneratedClient, CertManagement.Options.RestartPods); err != nil {
 			errs = append(errs, err)
 		}
 	}
+	firstSync = false
 	return errorhelpers.NewMultiLineAggregate(errs)
 }

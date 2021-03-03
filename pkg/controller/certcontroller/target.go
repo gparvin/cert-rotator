@@ -73,7 +73,7 @@ func (c TargetRotation) EnsureTargetCertKeyPair(signingCertKeyPair *crypto.CA, c
 		}
 	}
 
-	if restartPods {
+	if restartPods && !firstSync {
 		deploymentsInterface := client.AppsV1().Deployments(c.Namespace)
 		statefulsetsInterface := client.AppsV1().StatefulSets(c.Namespace)
 		daemonsetsInterface := client.AppsV1().DaemonSets(c.Namespace)
@@ -176,14 +176,20 @@ func restart(deploymentsInterface appsv1.DeploymentInterface, statefulsetsInterf
 	statefulsets, _ := statefulsetsInterface.List(context.TODO(), listOptions)
 	daemonsets, _ := daemonsetsInterface.List(context.TODO(), listOptions)
 
-	update := time.Now().Format("2006-1-2.1504")
+	update := time.Now().Format("2006-1-2.150417.000")
 	updateOptions := metav1.UpdateOptions{}
 NEXT_DEPLOYMENT:
 	for _, adeployment := range deployments.Items {
 		deployment := adeployment
 		for _, volume := range deployment.Spec.Template.Spec.Volumes {
 			if volume.Secret != nil && volume.Secret.SecretName != "" && volume.Secret.SecretName == secret && deployment.ObjectMeta.Annotations[noRestartAnnotation] != "true" {
+				if deployment.ObjectMeta.Labels == nil {
+					deployment.ObjectMeta.Labels = make(map[string]string)
+				}
 				deployment.ObjectMeta.Labels[restartLabel] = update
+				if deployment.Spec.Template.ObjectMeta.Labels == nil {
+					deployment.Spec.Template.ObjectMeta.Labels = make(map[string]string)
+				}
 				deployment.Spec.Template.ObjectMeta.Labels[restartLabel] = update
 				_, err := deploymentsInterface.Update(context.TODO(), &deployment, updateOptions)
 				if err != nil {
@@ -199,7 +205,13 @@ NEXT_STATEFULSET:
 		statefulset := astatefulset
 		for _, volume := range statefulset.Spec.Template.Spec.Volumes {
 			if volume.Secret != nil && volume.Secret.SecretName != "" && volume.Secret.SecretName == secret && statefulset.ObjectMeta.Annotations[noRestartAnnotation] != "true" {
+				if statefulset.ObjectMeta.Labels == nil {
+					statefulset.ObjectMeta.Labels = make(map[string]string)
+				}
 				statefulset.ObjectMeta.Labels[restartLabel] = update
+				if statefulset.Spec.Template.ObjectMeta.Labels == nil {
+					statefulset.Spec.Template.ObjectMeta.Labels = make(map[string]string)
+				}
 				statefulset.Spec.Template.ObjectMeta.Labels[restartLabel] = update
 				_, err := statefulsetsInterface.Update(context.TODO(), &statefulset, updateOptions)
 				if err != nil {
@@ -215,7 +227,13 @@ NEXT_DAEMONSET:
 		daemonset := adaemonset
 		for _, volume := range daemonset.Spec.Template.Spec.Volumes {
 			if volume.Secret != nil && volume.Secret.SecretName != "" && volume.Secret.SecretName == secret && daemonset.ObjectMeta.Annotations[noRestartAnnotation] != "true" {
+				if daemonset.ObjectMeta.Labels == nil {
+					daemonset.ObjectMeta.Labels = make(map[string]string)
+				}
 				daemonset.ObjectMeta.Labels[restartLabel] = update
+				if daemonset.Spec.Template.ObjectMeta.Labels == nil {
+					daemonset.Spec.Template.ObjectMeta.Labels = make(map[string]string)
+				}
 				daemonset.Spec.Template.ObjectMeta.Labels[restartLabel] = update
 				_, err := daemonsetsInterface.Update(context.TODO(), &daemonset, updateOptions)
 				if err != nil {

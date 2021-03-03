@@ -161,7 +161,7 @@ func main() {
 		HostNames:  []string{"added-secret.default.svc"},
 		Client:     generatedClient,
 	}
-	certctrl.AddTarget(context.TODO(), c, target)
+	certctrl.AddTarget(context.TODO(), target)
 
 	if err := mgr.Start(ctrl.SetupSignalHandler()); err != nil {
 		setupLog.Error(err, "problem running manager")
